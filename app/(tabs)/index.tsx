@@ -4,7 +4,6 @@ import {
   FlatList,
   PermissionsAndroid,
   Platform,
-  StyleSheet,
   Text,
   TouchableOpacity,
   View,
@@ -18,9 +17,7 @@ export default function App() {
   const [connectedDevice, setConnectedDevice] = useState<Device | null>(null);
 
   useEffect(() => {
-    // 请求蓝牙权限
     requestPermissions();
-
     return () => {
       bleManager.destroy();
     };
@@ -29,7 +26,6 @@ export default function App() {
   const requestPermissions = async () => {
     if (Platform.OS === 'android') {
       if (Platform.Version >= 31) {
-        // Android 12+
         const granted = await PermissionsAndroid.requestMultiple([
           PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN,
           PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT,
@@ -44,7 +40,6 @@ export default function App() {
           Alert.alert('权限被拒绝', '应用需要蓝牙权限才能工作');
         }
       } else {
-        // Android 11 及以下
         const granted = await PermissionsAndroid.request(
           PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION
         );
@@ -69,7 +64,6 @@ export default function App() {
 
       if (device && device.name) {
         setDevices(prevDevices => {
-          // 避免重复添加设备
           if (prevDevices.find(d => d.id === device.id)) {
             return prevDevices;
           }
@@ -78,7 +72,6 @@ export default function App() {
       }
     });
 
-    // 10秒后停止扫描
     setTimeout(() => {
       bleManager.stopDeviceScan();
       setScanning(false);
@@ -97,13 +90,12 @@ export default function App() {
       
       Alert.alert('连接成功', `已连接到 ${device.name}`);
       
-      // 获取服务信息
       const services = await connected.services();
       console.log('设备服务:', services);
       
-    } catch (error) {
+    } catch (error: any) {
       console.error('连接错误:', error);
-      Alert.alert('连接失败', error instanceof Error ? error.message : String(error));
+      Alert.alert('连接失败', error.message);
     }
   };
 
@@ -117,39 +109,51 @@ export default function App() {
 
   const renderDevice = ({ item }: { item: Device }) => (
     <TouchableOpacity
-      style={styles.deviceItem}
+      className="bg-white p-4 rounded-xl mb-3 shadow-md active:opacity-80"
       onPress={() => connectToDevice(item)}
     >
-      <Text style={styles.deviceName}>{item.name || '未命名设备'}</Text>
-      <Text style={styles.deviceId}>ID: {item.id}</Text>
-      <Text style={styles.rssi}>信号强度: {item.rssi} dBm</Text>
+      <Text className="text-lg font-semibold text-gray-800 mb-1">
+        {item.name || '未命名设备'}
+      </Text>
+      <Text className="text-xs text-gray-500 mb-1">
+        ID: {item.id}
+      </Text>
+      <Text className="text-xs text-gray-400">
+        信号强度: {item.rssi} dBm
+      </Text>
     </TouchableOpacity>
   );
 
   return (
-    <View style={styles.container}>
-      <Text style={styles.title}>Expo BLE 示例</Text>
+    <View className="flex-1 px-5 pt-16 bg-gray-50">
+      <Text className="text-3xl font-bold mb-6 text-center text-gray-800">
+        Expo BLE 示例
+      </Text>
       
       {connectedDevice ? (
-        <View style={styles.connectedContainer}>
-          <Text style={styles.connectedText}>
+        <View className="bg-green-500 p-5 rounded-xl mb-5">
+          <Text className="text-white text-lg font-semibold mb-4 text-center">
             已连接: {connectedDevice.name}
           </Text>
           <TouchableOpacity
-            style={[styles.button, styles.disconnectButton]}
+            className="bg-red-500 py-4 rounded-lg active:opacity-80"
             onPress={disconnectDevice}
           >
-            <Text style={styles.buttonText}>断开连接</Text>
+            <Text className="text-white text-center text-base font-semibold">
+              断开连接
+            </Text>
           </TouchableOpacity>
         </View>
       ) : (
         <>
           <TouchableOpacity
-            style={[styles.button, scanning && styles.buttonDisabled]}
+            className={`py-4 rounded-lg mb-5 active:opacity-80 ${
+              scanning ? 'bg-gray-400' : 'bg-blue-500'
+            }`}
             onPress={scanDevices}
             disabled={scanning}
           >
-            <Text style={styles.buttonText}>
+            <Text className="text-white text-center text-base font-semibold">
               {scanning ? '扫描中...' : '开始扫描'}
             </Text>
           </TouchableOpacity>
@@ -158,9 +162,8 @@ export default function App() {
             data={devices}
             renderItem={renderDevice}
             keyExtractor={item => item.id}
-            style={styles.list}
             ListEmptyComponent={
-              <Text style={styles.emptyText}>
+              <Text className="text-center text-gray-400 mt-12 text-base">
                 {scanning ? '正在搜索设备...' : '点击按钮开始扫描'}
               </Text>
             }
@@ -170,86 +173,6 @@ export default function App() {
     </View>
   );
 }
-
-const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    padding: 20,
-    paddingTop: 60,
-    backgroundColor: '#f5f5f5',
-  },
-  title: {
-    fontSize: 24,
-    fontWeight: 'bold',
-    marginBottom: 20,
-    textAlign: 'center',
-  },
-  button: {
-    backgroundColor: '#007AFF',
-    padding: 15,
-    borderRadius: 10,
-    alignItems: 'center',
-    marginBottom: 20,
-  },
-  buttonDisabled: {
-    backgroundColor: '#ccc',
-  },
-  disconnectButton: {
-    backgroundColor: '#FF3B30',
-  },
-  buttonText: {
-    color: 'white',
-    fontSize: 16,
-    fontWeight: '600',
-  },
-  list: {
-    flex: 1,
-  },
-  deviceItem: {
-    backgroundColor: 'white',
-    padding: 15,
-    borderRadius: 10,
-    marginBottom: 10,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.1,
-    shadowRadius: 4,
-    elevation: 3,
-  },
-  deviceName: {
-    fontSize: 18,
-    fontWeight: '600',
-    marginBottom: 5,
-  },
-  deviceId: {
-    fontSize: 12,
-    color: '#666',
-    marginBottom: 3,
-  },
-  rssi: {
-    fontSize: 12,
-    color: '#999',
-  },
-  emptyText: {
-    textAlign: 'center',
-    color: '#999',
-    marginTop: 50,
-    fontSize: 16,
-  },
-  connectedContainer: {
-    backgroundColor: '#4CAF50',
-    padding: 20,
-    borderRadius: 10,
-    marginBottom: 20,
-  },
-  connectedText: {
-    color: 'white',
-    fontSize: 18,
-    fontWeight: '600',
-    marginBottom: 15,
-    textAlign: 'center',
-  },
-});
 
 
 
