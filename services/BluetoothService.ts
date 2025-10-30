@@ -42,6 +42,8 @@ class BluetoothService {
   private speedPollTimer: any = null; // 速度轮询 #
   private notificationBufferHex: string = ''; // 通知帧缓冲 #
   private concatenatedNotifyHex: string = ''; // 连续NOTIFY十六进制累积（原始拼接） #
+  private expectingDataResponse: boolean = false; // 是否在等待 7E7F50 响应（兼容无尾帧） #
+  private dataResponseWindowHex: string = ''; // 7E7F50 响应分片累积窗口 #
   private notificationSubscription: { remove: () => void } | null = null; // 通知订阅句柄 #
   private disconnectionSubscription: { remove: () => void } | null = null; // 断开连接监听句柄 #
 
@@ -508,6 +510,12 @@ class BluetoothService {
         return false;
       }
 
+      // 若是请求综合数据，开启一次性“期待响应窗口”（兼容从机无尾帧场景）
+      if (hexCommand === this.REQUEST_DATA) {
+        this.expectingDataResponse = true;
+        this.dataResponseWindowHex = '';
+      }
+
       // 将十六进制字符串转换为字节数组
       const bytes = this.hexStringToBytes(hexCommand);
       const base64Data = this.bytesToBase64(bytes);
@@ -771,19 +779,38 @@ class BluetoothService {
           console.error(`[${this.now()}] [CALLBACK] 原始NOTIFY回调错误:`, e);
         }
       }
-      // 兼容：若没有标准帧，也尝试从累积尾部12字节解析 [pressure][speed][mode]
-      const fb = this.parseTail12Reversed(this.concatenatedNotifyHex);
-      if (fb) {
-        console.log(`[${this.now()}] [PARSE-FALLBACK] 综合数据 mode=${fb.mode} speed=${fb.speed} pressure=${fb.pressure}`);
-        const mode = this.modeValueToDeviceMode(fb.mode);
-        if (mode && this.onModeChangeCallback && this.connectedDevice) {
-          try { this.onModeChangeCallback(mode); } catch (error) { console.error(`[${this.now()}] [CALLBACK] 模式回调错误:`, error); }
+      // 兼容：仅在发送过 7E7F50 请求后，聚合分片到专用窗口并从尾部12字节解析 [pressure][speed][mode]
+      if (this.expectingDataResponse) {
+        this.dataResponseWindowHex += hex;
+        // 窗口控长，避免无限增长（保留最后 128 字节）
+        if (this.dataResponseWindowHex.length > 256) {
+          this.dataResponseWindowHex = this.dataResponseWindowHex.slice(-256);
         }
-        if (this.onSpeedUpdateCallback && this.connectedDevice) {
-          try { this.onSpeedUpdateCallback(fb.speed); } catch (error) { console.error(`[${this.now()}] [CALLBACK] 转速回调错误:`, error); }
-        }
-        if (this.onPressureUpdateCallback && this.connectedDevice) {
-          try { this.onPressureUpdateCallback(fb.pressure); } catch (error) { console.error(`[${this.now()}] [CALLBACK] 压力回调错误:`, error); }
+        // 满足至少12字节后尝试解析
+        if (this.dataResponseWindowHex.length >= 24) {
+          const fb = this.parseTail12Reversed(this.dataResponseWindowHex);
+          if (fb) {
+            // 基本合理性校验，避免把零填充或头部误当作数据
+            const modeOk = fb.mode >= 0 && fb.mode <= 4;
+            const speedOk = fb.speed >= 0 && fb.speed < 200000; // 合理上限
+            const pressureOk = Number.isFinite(fb.pressure) && Math.abs(fb.pressure) < 1000;
+            if (modeOk && (speedOk || pressureOk)) {
+              console.log(`[${this.now()}] [PARSE-FALLBACK] 综合数据 mode=${fb.mode} speed=${fb.speed} pressure=${fb.pressure}`);
+              const mode = this.modeValueToDeviceMode(fb.mode);
+              if (mode && this.onModeChangeCallback && this.connectedDevice) {
+                try { this.onModeChangeCallback(mode); } catch (error) { console.error(`[${this.now()}] [CALLBACK] 模式回调错误:`, error); }
+              }
+              if (this.onSpeedUpdateCallback && this.connectedDevice) {
+                try { this.onSpeedUpdateCallback(fb.speed); } catch (error) { console.error(`[${this.now()}] [CALLBACK] 转速回调错误:`, error); }
+              }
+              if (this.onPressureUpdateCallback && this.connectedDevice) {
+                try { this.onPressureUpdateCallback(fb.pressure); } catch (error) { console.error(`[${this.now()}] [CALLBACK] 压力回调错误:`, error); }
+              }
+              // 一次请求-应答完成，关闭窗口
+              this.expectingDataResponse = false;
+              this.dataResponseWindowHex = '';
+            }
+          }
         }
       }
       this.notificationBufferHex += hex; // 追加 #
