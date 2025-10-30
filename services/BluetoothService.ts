@@ -620,6 +620,39 @@ class BluetoothService {
     }
   }
 
+  // 兼容解析：从累积hex的末尾12字节，按 [pressure(float32)][speed(int32)][mode(int32)] (LE)
+  private parseTail12Reversed(concatenatedHex: string): { mode: number; speed: number; pressure: number } | null {
+    try {
+      const hex = (concatenatedHex || '').toUpperCase().replace(/[^0-9A-F]/g, '');
+      if (hex.length < 24) return null; // 至少12字节
+      const tail12 = hex.slice(-24);
+      const toBytes = (h: string) => {
+        const arr: number[] = [];
+        for (let i = 0; i < h.length; i += 2) arr.push(parseInt(h.substr(i, 2), 16));
+        return arr;
+      };
+      const bytes = toBytes(tail12);
+      if (bytes.length !== 12) return null;
+
+      const pressureBytes = bytes.slice(0, 4);
+      const speedBytes = bytes.slice(4, 8);
+      const modeBytes = bytes.slice(8, 12);
+
+      const pressureView = new DataView(new ArrayBuffer(4));
+      pressureBytes.forEach((b, i) => pressureView.setUint8(i, b));
+      const pressure = pressureView.getFloat32(0, true);
+
+      const speed = (speedBytes[3] << 24) | (speedBytes[2] << 16) | (speedBytes[1] << 8) | speedBytes[0];
+      const mode = (modeBytes[3] << 24) | (modeBytes[2] << 16) | (modeBytes[1] << 8) | modeBytes[0];
+
+      console.log(`[${this.now()}] [PARSE-FALLBACK] tail12=${tail12} -> mode=${mode} speed=${speed} pressure=${pressure}`);
+      return { mode, speed, pressure };
+    } catch (e) {
+      console.error(`[${this.now()}] [PARSE-FALLBACK] 解析失败:`, e);
+      return null;
+    }
+  }
+
   // 模式值转换为DeviceMode
   private modeValueToDeviceMode(modeValue: number): DeviceMode | null {
     const modeMap: { [key: number]: DeviceMode } = {
@@ -736,6 +769,21 @@ class BluetoothService {
           this.onRawNotifyCallback(hex, this.concatenatedNotifyHex);
         } catch (e) {
           console.error(`[${this.now()}] [CALLBACK] 原始NOTIFY回调错误:`, e);
+        }
+      }
+      // 兼容：若没有标准帧，也尝试从累积尾部12字节解析 [pressure][speed][mode]
+      const fb = this.parseTail12Reversed(this.concatenatedNotifyHex);
+      if (fb) {
+        console.log(`[${this.now()}] [PARSE-FALLBACK] 综合数据 mode=${fb.mode} speed=${fb.speed} pressure=${fb.pressure}`);
+        const mode = this.modeValueToDeviceMode(fb.mode);
+        if (mode && this.onModeChangeCallback && this.connectedDevice) {
+          try { this.onModeChangeCallback(mode); } catch (error) { console.error(`[${this.now()}] [CALLBACK] 模式回调错误:`, error); }
+        }
+        if (this.onSpeedUpdateCallback && this.connectedDevice) {
+          try { this.onSpeedUpdateCallback(fb.speed); } catch (error) { console.error(`[${this.now()}] [CALLBACK] 转速回调错误:`, error); }
+        }
+        if (this.onPressureUpdateCallback && this.connectedDevice) {
+          try { this.onPressureUpdateCallback(fb.pressure); } catch (error) { console.error(`[${this.now()}] [CALLBACK] 压力回调错误:`, error); }
         }
       }
       this.notificationBufferHex += hex; // 追加 #
