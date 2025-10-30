@@ -41,6 +41,7 @@ class BluetoothService {
   private readCharUuid: string | null = null; // 通知特征UUID #
   private speedPollTimer: any = null; // 速度轮询 #
   private notificationBufferHex: string = ''; // 通知帧缓冲 #
+  private concatenatedNotifyHex: string = ''; // 连续NOTIFY十六进制累积（原始拼接） #
   private notificationSubscription: { remove: () => void } | null = null; // 通知订阅句柄 #
   private disconnectionSubscription: { remove: () => void } | null = null; // 断开连接监听句柄 #
 
@@ -50,6 +51,7 @@ class BluetoothService {
   private onVoltageUpdateCallback?: (voltage: number) => void;
   private onPressureUpdateCallback?: (pressure: number) => void;
   private onDeviceDisconnectedCallback?: () => void;
+  private onRawNotifyCallback?: (fragmentHex: string, concatenatedHex: string) => void; // 原始NOTIFY片段/累积回调 #
 
   // 控制指令映射
   private readonly COMMANDS = {
@@ -362,6 +364,7 @@ class BluetoothService {
     this.notificationSubscription = null;
     this.disconnectionSubscription = null;
     this.notificationBufferHex = '';
+    this.concatenatedNotifyHex = '';
     console.log(`[${this.now()}] [DISCONNECT] 引用已清空（回调将自动忽略）`);
     
     // 4. 短暂延迟，让所有正在执行的回调完成
@@ -430,6 +433,7 @@ class BluetoothService {
     this.notificationSubscription = null;
     this.disconnectionSubscription = null;
     this.notificationBufferHex = '';
+    this.concatenatedNotifyHex = '';
     console.log(`[${this.now()}] [UNEXPECTED_DISCONNECT] 引用已清空`);
     
     // 3. 清除所有回调（在触发断开回调之前）
@@ -539,6 +543,11 @@ class BluetoothService {
     this.onDeviceDisconnectedCallback = callback;
   }
 
+  // 设置原始NOTIFY回调（用于兼容非标准帧/直接在UI显示原始数据）
+  setOnRawNotifyCallback(callback: (fragmentHex: string, concatenatedHex: string) => void): void {
+    this.onRawNotifyCallback = callback;
+  }
+
   // 解析转速hex（使用小端序）
   private parseSpeedFromHex(hexString: string): number {
     const speedHex = hexString.substring(6, 14); // 8个字符
@@ -566,10 +575,12 @@ class BluetoothService {
     try {
       // 移除帧头和帧尾：7E7F50...FBFD
       if (!hexString.startsWith('7E7F50') || !hexString.endsWith('FBFD')) {
+        console.warn(`[${this.now()}] [PARSE] 帧头尾不匹配 head=${hexString.slice(0,6)} tail=${hexString.slice(-4)} full=${hexString}`);
         return null;
       }
       
       const dataHex = hexString.substring(6, hexString.length - 4); // 移除7E7F50和FBFD
+      console.log(`[${this.now()}] [PARSE] dataHex=${dataHex} (len=${dataHex.length/2} bytes)`);
       const bytes = [];
       for (let i = 0; i < dataHex.length; i += 2) {
         bytes.push(parseInt(dataHex.substr(i, 2), 16));
@@ -577,26 +588,30 @@ class BluetoothService {
 
       // 从末尾开始解析，每4个字节一个值
       if (bytes.length < 12) {
-        console.warn(`[${this.now()}] [PARSE] 数据长度不足 len=${bytes.length}`);
+        console.warn(`[${this.now()}] [PARSE] 数据长度不足 len=${bytes.length} rawDataHex=${dataHex}`);
         return null;
       }
 
       // 从末尾提取最后12个字节（3个int32/float32值）
       const dataBytes = bytes.slice(-12);
+      console.log(`[${this.now()}] [PARSE] 截取最后12字节=${this.bytesToHexString(dataBytes)} (len=12)`);
       
       // 解析压力（float，最后4个字节，小端序）
       const pressureBytes = dataBytes.slice(8, 12);
       const pressureView = new DataView(new ArrayBuffer(4));
       pressureBytes.forEach((byte, i) => pressureView.setUint8(i, byte));
       const pressure = pressureView.getFloat32(0, true); // true = 小端序
+      console.log(`[${this.now()}] [PARSE] 压力 pressureBytes(LE)=${this.bytesToHexString(pressureBytes)} -> pressure=${pressure}`);
 
       // 解析转速（int，中间4个字节，小端序）
       const speedBytes = dataBytes.slice(4, 8);
       const speed = (speedBytes[3] << 24) | (speedBytes[2] << 16) | (speedBytes[1] << 8) | speedBytes[0];
+      console.log(`[${this.now()}] [PARSE] 转速 speedBytes(LE)=${this.bytesToHexString(speedBytes)} -> speed=${speed}`);
 
       // 解析模式（int，前4个字节，小端序）
       const modeBytes = dataBytes.slice(0, 4);
       const mode = (modeBytes[3] << 24) | (modeBytes[2] << 16) | (modeBytes[1] << 8) | modeBytes[0];
+      console.log(`[${this.now()}] [PARSE] 模式 modeBytes(LE)=${this.bytesToHexString(modeBytes)} -> mode=${mode}`);
 
       return { mode, speed, pressure };
     } catch (error) {
@@ -713,6 +728,16 @@ class BluetoothService {
       const hex = this.bytesToHexString(this.base64ToBytes(base64Data)); // 转十六进制 #
       console.log(`[${this.now()}] [NOTIFY] rawBase64=${base64Data}`);
       console.log(`[${this.now()}] [NOTIFY] hex=${hex}`);
+      // 记录原始连续NOTIFY拼接（便于调试/上层一次性读取）
+      this.concatenatedNotifyHex += hex;
+      // 通知上层原始片段与当前累积（兼容从机非标准格式时在UI直接显示）
+      if (this.onRawNotifyCallback && this.connectedDevice) {
+        try {
+          this.onRawNotifyCallback(hex, this.concatenatedNotifyHex);
+        } catch (e) {
+          console.error(`[${this.now()}] [CALLBACK] 原始NOTIFY回调错误:`, e);
+        }
+      }
       this.notificationBufferHex += hex; // 追加 #
       const HEAD = '7E7F', TAIL = 'FBFD'; // 帧界定 #
       while (true) {
@@ -760,6 +785,16 @@ class BluetoothService {
   // 请求综合数据（模式、转速、压力）
   async requestData(): Promise<boolean> { return await this.sendCommand(this.REQUEST_DATA); }
   
+  // 获取最近一次会话自开始/上次清理以来连续收到的NOTIFY十六进制拼接值
+  getConcatenatedNotifyHex(): string {
+    return this.concatenatedNotifyHex;
+  }
+
+  // 清空连续NOTIFY十六进制拼接值
+  clearConcatenatedNotifyHex(): void {
+    this.concatenatedNotifyHex = '';
+  }
+
   // 开启数据轮询（300ms）
   private startSpeedPolling(): void {
     if (this.speedPollTimer) { clearInterval(this.speedPollTimer); this.speedPollTimer = null; }
