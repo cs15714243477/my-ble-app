@@ -42,8 +42,8 @@ class BluetoothService {
   private speedPollTimer: any = null; // 速度轮询 #
   private notificationBufferHex: string = ''; // 通知帧缓冲 #
   private concatenatedNotifyHex: string = ''; // 连续NOTIFY十六进制累积（原始拼接） #
-  private expectingDataResponse: boolean = false; // 是否在等待 7E7F50 响应（兼容无尾帧） #
-  private dataResponseWindowHex: string = ''; // 7E7F50 响应分片累积窗口 #
+  private lastFallbackSliceHex: string | null = null; // 上次成功的兼容解析片段（去抖） #
+  private openFrameBufferHex: string = ''; // 基于7E7F30的开放帧缓冲（按帧头切分） #
   private notificationSubscription: { remove: () => void } | null = null; // 通知订阅句柄 #
   private disconnectionSubscription: { remove: () => void } | null = null; // 断开连接监听句柄 #
 
@@ -367,6 +367,7 @@ class BluetoothService {
     this.disconnectionSubscription = null;
     this.notificationBufferHex = '';
     this.concatenatedNotifyHex = '';
+    this.openFrameBufferHex = '';
     console.log(`[${this.now()}] [DISCONNECT] 引用已清空（回调将自动忽略）`);
     
     // 4. 短暂延迟，让所有正在执行的回调完成
@@ -436,6 +437,7 @@ class BluetoothService {
     this.disconnectionSubscription = null;
     this.notificationBufferHex = '';
     this.concatenatedNotifyHex = '';
+    this.openFrameBufferHex = '';
     console.log(`[${this.now()}] [UNEXPECTED_DISCONNECT] 引用已清空`);
     
     // 3. 清除所有回调（在触发断开回调之前）
@@ -510,11 +512,7 @@ class BluetoothService {
         return false;
       }
 
-      // 若是请求综合数据，开启一次性“期待响应窗口”（兼容从机无尾帧场景）
-      if (hexCommand === this.REQUEST_DATA) {
-        this.expectingDataResponse = true;
-        this.dataResponseWindowHex = '';
-      }
+      // 兼容解析在通知回调中进行，这里不做额外状态处理
 
       // 将十六进制字符串转换为字节数组
       const bytes = this.hexStringToBytes(hexCommand);
@@ -628,33 +626,55 @@ class BluetoothService {
     }
   }
 
-  // 兼容解析：从累积hex的末尾12字节，按 [pressure(float32)][speed(int32)][mode(int32)] (LE)
-  private parseTail12Reversed(concatenatedHex: string): { mode: number; speed: number; pressure: number } | null {
+  // 兼容解析（启发式）：在末尾窗口中扫描12字节切片，按 [pressure(float32)][speed(int32)][mode(int32)] (LE)
+  // 仅当满足合理范围时返回，避免错误解析噪声
+  private parseTail12Reversed(concatenatedHex: string): { mode: number; speed: number; pressure: number; sliceHex: string } | null {
     try {
       const hex = (concatenatedHex || '').toUpperCase().replace(/[^0-9A-F]/g, '');
       if (hex.length < 24) return null; // 至少12字节
-      const tail12 = hex.slice(-24);
-      const toBytes = (h: string) => {
-        const arr: number[] = [];
-        for (let i = 0; i < h.length; i += 2) arr.push(parseInt(h.substr(i, 2), 16));
-        return arr;
-      };
-      const bytes = toBytes(tail12);
-      if (bytes.length !== 12) return null;
+      const windowHexLen = Math.min(hex.length, 240); // 窗口最大120字节（240个hex字符）
 
-      const pressureBytes = bytes.slice(0, 4);
-      const speedBytes = bytes.slice(4, 8);
-      const modeBytes = bytes.slice(8, 12);
+      // 从末尾向前按1字节步长扫描，寻找“可信切片”
+      for (let end = hex.length; end >= hex.length - windowHexLen + 24; end -= 2) {
+        const start = end - 24;
+        const sliceHex = hex.slice(start, end);
+        const toBytes = (h: string) => {
+          const arr: number[] = [];
+          for (let i = 0; i < h.length; i += 2) arr.push(parseInt(h.substr(i, 2), 16));
+          return arr;
+        };
+        const bytes = toBytes(sliceHex);
+        if (bytes.length !== 12) continue;
 
-      const pressureView = new DataView(new ArrayBuffer(4));
-      pressureBytes.forEach((b, i) => pressureView.setUint8(i, b));
-      const pressure = pressureView.getFloat32(0, true);
+        const pressureBytes = bytes.slice(0, 4);
+        const speedBytes = bytes.slice(4, 8);
+        const modeBytes = bytes.slice(8, 12);
 
-      const speed = (speedBytes[3] << 24) | (speedBytes[2] << 16) | (speedBytes[1] << 8) | speedBytes[0];
-      const mode = (modeBytes[3] << 24) | (modeBytes[2] << 16) | (modeBytes[1] << 8) | modeBytes[0];
+        // 全0直接跳过
+        const allZero = bytes.every(b => b === 0);
+        if (allZero) continue;
 
-      console.log(`[${this.now()}] [PARSE-FALLBACK] tail12=${tail12} -> mode=${mode} speed=${speed} pressure=${pressure}`);
-      return { mode, speed, pressure };
+        const pressureView = new DataView(new ArrayBuffer(4));
+        pressureBytes.forEach((b, i) => pressureView.setUint8(i, b));
+        const pressure = pressureView.getFloat32(0, true);
+
+        const speed = (speedBytes[3] << 24) | (speedBytes[2] << 16) | (speedBytes[1] << 8) | speedBytes[0];
+        const mode = (modeBytes[3] << 24) | (modeBytes[2] << 16) | (modeBytes[1] << 8) | modeBytes[0];
+
+        // 合理性约束（可按需要调整）
+        const modeOk = Number.isInteger(mode) && mode >= 0 && mode <= 4; // 限定5种模式
+        const speedOk = Number.isInteger(speed) && speed >= 0 && speed <= 20000; // 0~20000 RPM
+        const pressureOk = Number.isFinite(pressure) && pressure >= 0 && pressure <= 10; // 0~10 bar/任意单位
+
+        if (modeOk && speedOk && pressureOk) {
+          // 去抖：若与上次同切片则忽略
+          if (this.lastFallbackSliceHex === sliceHex) return null;
+          this.lastFallbackSliceHex = sliceHex;
+          console.log(`[${this.now()}] [PARSE-FALLBACK] slice=${sliceHex} -> mode=${mode} speed=${speed} pressure=${pressure}`);
+          return { mode, speed, pressure, sliceHex };
+        }
+      }
+      return null;
     } catch (e) {
       console.error(`[${this.now()}] [PARSE-FALLBACK] 解析失败:`, e);
       return null;
@@ -779,38 +799,19 @@ class BluetoothService {
           console.error(`[${this.now()}] [CALLBACK] 原始NOTIFY回调错误:`, e);
         }
       }
-      // 兼容：仅在发送过 7E7F50 请求后，聚合分片到专用窗口并从尾部12字节解析 [pressure][speed][mode]
-      if (this.expectingDataResponse) {
-        this.dataResponseWindowHex += hex;
-        // 窗口控长，避免无限增长（保留最后 128 字节）
-        if (this.dataResponseWindowHex.length > 256) {
-          this.dataResponseWindowHex = this.dataResponseWindowHex.slice(-256);
+      // 兼容：若没有标准帧，也尝试从累积尾部12字节解析 [pressure][speed][mode]
+      const fb = this.parseTail12Reversed(this.concatenatedNotifyHex);
+      if (fb) {
+        console.log(`[${this.now()}] [PARSE-FALLBACK] 综合数据 mode=${fb.mode} speed=${fb.speed} pressure=${fb.pressure}`);
+        const mode = this.modeValueToDeviceMode(fb.mode);
+        if (mode && this.onModeChangeCallback && this.connectedDevice) {
+          try { this.onModeChangeCallback(mode); } catch (error) { console.error(`[${this.now()}] [CALLBACK] 模式回调错误:`, error); }
         }
-        // 满足至少12字节后尝试解析
-        if (this.dataResponseWindowHex.length >= 24) {
-          const fb = this.parseTail12Reversed(this.dataResponseWindowHex);
-          if (fb) {
-            // 基本合理性校验，避免把零填充或头部误当作数据
-            const modeOk = fb.mode >= 0 && fb.mode <= 4;
-            const speedOk = fb.speed >= 0 && fb.speed < 200000; // 合理上限
-            const pressureOk = Number.isFinite(fb.pressure) && Math.abs(fb.pressure) < 1000;
-            if (modeOk && (speedOk || pressureOk)) {
-              console.log(`[${this.now()}] [PARSE-FALLBACK] 综合数据 mode=${fb.mode} speed=${fb.speed} pressure=${fb.pressure}`);
-              const mode = this.modeValueToDeviceMode(fb.mode);
-              if (mode && this.onModeChangeCallback && this.connectedDevice) {
-                try { this.onModeChangeCallback(mode); } catch (error) { console.error(`[${this.now()}] [CALLBACK] 模式回调错误:`, error); }
-              }
-              if (this.onSpeedUpdateCallback && this.connectedDevice) {
-                try { this.onSpeedUpdateCallback(fb.speed); } catch (error) { console.error(`[${this.now()}] [CALLBACK] 转速回调错误:`, error); }
-              }
-              if (this.onPressureUpdateCallback && this.connectedDevice) {
-                try { this.onPressureUpdateCallback(fb.pressure); } catch (error) { console.error(`[${this.now()}] [CALLBACK] 压力回调错误:`, error); }
-              }
-              // 一次请求-应答完成，关闭窗口
-              this.expectingDataResponse = false;
-              this.dataResponseWindowHex = '';
-            }
-          }
+        if (this.onSpeedUpdateCallback && this.connectedDevice) {
+          try { this.onSpeedUpdateCallback(fb.speed); } catch (error) { console.error(`[${this.now()}] [CALLBACK] 转速回调错误:`, error); }
+        }
+        if (this.onPressureUpdateCallback && this.connectedDevice) {
+          try { this.onPressureUpdateCallback(fb.pressure); } catch (error) { console.error(`[${this.now()}] [CALLBACK] 压力回调错误:`, error); }
         }
       }
       this.notificationBufferHex += hex; // 追加 #
